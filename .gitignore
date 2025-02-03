@@ -1,0 +1,17 @@
+.dub
+docs.json
+__dummy.html
+docs/
+/termdd
+termdd.so
+termdd.dylib
+termdd.dll
+termdd.a
+termdd.lib
+termdd-test-*
+*.exe
+*.pdb
+*.o
+*.obj
+*.lst
+*.json
