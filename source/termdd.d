@@ -17,11 +17,10 @@ else
 }
 
 import core.stdc.stdlib : atexit;
-import core.stdc.stdio : EOF;
+import core.stdc.stdio : EOF, fflush, stdout, stdin;
 import core.stdc.ctype : iscntrl;
 
-// Due to bad mangling
-extern (C) int getchar();
+// Redefined here due to bad mangling names
 extern (C) int putchar(int);
 
 // Internal state
@@ -56,50 +55,6 @@ void term_exiting()
     tcsetattr(STDIN_FILENO, TCSANOW, &oistdin);
 }
 
-/// Hide key input from being echo'd.
-void term_hide()
-{
-    term_init();
-    
-version (Windows)
-{
-    HANDLE hstdin = GetStdHandle(STD_INPUT_HANDLE); 
-    DWORD mode = void;
-    GetConsoleMode(hstdin, &mode);
-    SetConsoleMode(hstdin, mode & ~ENABLE_ECHO_INPUT);
-}
-else version (Posix)
-{
-    termios term = void;
-    tcgetattr(STDIN_FILENO, &term);
-    term.c_lflag &= ~(ECHO|ICANON);
-    tcsetattr(STDIN_FILENO, TCSAFLUSH, &term);
-}
-else static assert(0, "Implement term_hide()");
-}
-
-/// Show key input again.
-void term_show()
-{
-    term_init();
-    
-version (Windows)
-{
-    HANDLE hstdin = GetStdHandle(STD_INPUT_HANDLE);
-    DWORD mode = void;
-    GetConsoleMode(hstdin, &mode);
-    SetConsoleMode(hstdin, mode | ENABLE_ECHO_INPUT);
-}
-else version (Posix)
-{
-    //tcsetattr(STDIN_FILENO, TCSANOW, &oistdin);
-    termios term = void;
-    tcgetattr(STDIN_FILENO, &term);
-    term.c_lflag |= ECHO|ICANON;
-    tcsetattr(STDIN_FILENO, TCSAFLUSH, &term);
-}
-}
-
 private
 int term_getchar_internal(void *handle)
 {
@@ -118,9 +73,23 @@ int term_getchar_internal(void *handle)
     }
     else version (Posix)
     {
-        int c;
-        read(*cast(int*)handle, &c, c.sizeof);
-        return c;
+        // Should be enough for escape codes
+        char[8] b = void;
+    Lagain:
+        ssize_t r = read(*cast(int*)handle, b.ptr, b.sizeof);
+        
+        // Error or zero bytes read (EOF)
+        if (r <= 0)
+        {
+            // Okay for EAGAIN, but problematic for others
+            goto Lagain;
+        }
+        
+        // ESC... Likely an escape code, retry.
+        if (b[0] == '\033')
+            goto Lagain;
+        
+        return b[0];
     }
     else static assert(0, "term_getchar()");
 }
@@ -134,11 +103,12 @@ int term_getchar_internal(void *handle)
 /// Returns: String buffer.
 string term_getpass(char rep = '*')
 {
-    term_hide();
+    // Init terminal internals
+    term_init();
     
     // To avoid the shell/cmd saving line buffers into their history,
-    // open the handle to the OS standard input.
-    // On error, fallback to standard input for the shell.
+    // open a new handle to the native standard input.
+    // On error, fallback to the already existing standard input stream.
     version (Windows)
     {
         HANDLE h = CreateFileA("CONIN$",
@@ -155,17 +125,44 @@ string term_getpass(char rep = '*')
     {
         int fd = open("/dev/tty", O_RDWR | O_NOCTTY);
         if (fd < 0)
+            fd = open("/dev/stdin", O_RDWR | O_NOCTTY); // works as-is
+        if (fd < 0)
             fd = STDIN_FILENO;
         void *h = &fd;
     }
     
-    // Read input and exit on newline, imitating a line
-    // buffer
+    // Hide terminal output
+    version (Windows)
+    {
+        enum LFLAGS = ENABLE_ECHO_INPUT;
+        DWORD mode = void;
+        GetConsoleMode(h, &mode);
+        SetConsoleMode(h, mode & ~LFLAGS);
+    }
+    else version (Posix)
+    {
+        enum LFLAGS = ECHO|ICANON;
+        termios term = void;
+        tcgetattr(fd, &term);
+        term.c_lflag &= ~LFLAGS;
+        tcsetattr(fd, TCSANOW, &term);
+    }
+    
     string buf;
 Lchar:
+    // Flush CRT stdout as it is, by default, line-buffered.
+    // Useful when text was written without a newline, like for a
+    // prompt, or anything we have written to it.
+    fflush(stdout);
+    
+    // Read input and exit on newline or EOF,
+    // imitating a line input buffer.
     int c = term_getchar_internal(h);
     switch (c) {
+    // EOL/EOF - Input is done
     case '\n', '\r', EOF: break;
+    
+    // Erase character
     case 127 /* DEL */, '\b' /* BS */:
         if (buf.length <= 0)
             goto Lchar;
@@ -176,27 +173,45 @@ Lchar:
         cast(void)putchar(' ');
         cast(void)putchar('\b');
         goto Lchar;
+    
     default:
+        // Just print the control character, it could be anything
         if (iscntrl(c))
         {
             cast(void)putchar(c);
             goto Lchar;
         }
         
+        // Insert character
         buf ~= cast(char)c;
         cast(void)putchar(rep);
         goto Lchar;
     }
     
-    cast(void)putchar('\n'); // Imitate readln()
-    term_show(); // Echo characters again
+    // Imitate readln(), no need to flush
+    cast(void)putchar('\n');
+    
+    // Restore state to echo characters
+    version (Windows)
+    {
+        DWORD mode = void;
+        GetConsoleMode(h, &mode);
+        SetConsoleMode(h, mode | LFLAGS);
+    }
+    else version (Posix)
+    {
+        tcgetattr(fd, &term);
+        term.c_lflag |= LFLAGS;
+        tcsetattr(fd, TCSANOW, &term);
+    }
+    
     return buf;
 }
 
 unittest
 {
-    import std.stdio : writeln, write, stdout;
-    write(`Type "test": `); stdout.flush();
+    import std.stdio : writeln, write;
+    write(`Type "test": `);
     string output = term_getpass();
     writeln("Output: ", output);
     assert(output == `test`);
